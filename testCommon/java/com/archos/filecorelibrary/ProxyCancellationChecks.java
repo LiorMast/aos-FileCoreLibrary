@@ -113,10 +113,14 @@ public abstract class ProxyCancellationChecks {
     }
 
     private static Socket request(Proxy proxy, String range) throws Exception {
+        return request(proxy, "/video.mkv", range);
+    }
+
+    private static Socket request(Proxy proxy, String target, String range) throws Exception {
         Uri uri = proxy.getUri("video.mkv");
         Socket socket = new Socket("127.0.0.1", uri.getPort());
         socket.setSoTimeout(2000);
-        String headers = "GET /video.mkv HTTP/1.0\r\n" + (range == null ? "" : "Range: " + range + "\r\n") + "\r\n";
+        String headers = "GET " + target + " HTTP/1.0\r\n" + (range == null ? "" : "Range: " + range + "\r\n") + "\r\n";
         socket.getOutputStream().write(headers.getBytes(StandardCharsets.US_ASCII));
         return socket;
     }
@@ -200,6 +204,40 @@ public abstract class ProxyCancellationChecks {
             assertEquals(1, proxy.closes.get());
             assertSame(proxy.owner, proxy.closer);
         } finally { proxy.proceed.countDown(); proxy.close(); }
+    }
+
+    @Test public void otherLaneDoesNotSupersede() throws Exception {
+        Proxy proxy = new Proxy("sftp", Stage.READ);
+        try (Socket first = request(proxy, "/video.mkv?lane=window", null)) {
+            assertTrue(proxy.entered.await(2, TimeUnit.SECONDS));
+            try (Socket second = request(proxy, "/video.mkv?lane=audio", "bytes=16-31")) {
+                String response = new String(second.getInputStream().readAllBytes(), StandardCharsets.ISO_8859_1);
+                assertTrue(response, response.startsWith("HTTP/1.0 206"));
+                assertEquals(16, response.substring(response.indexOf("\r\n\r\n") + 4).length());
+            }
+            finish(proxy);
+            String firstResponse = new String(first.getInputStream().readAllBytes(), StandardCharsets.ISO_8859_1);
+            assertTrue(firstResponse, firstResponse.startsWith("HTTP/1.0 200"));
+            assertEquals("The first lane's request must still be served", 64, firstResponse.substring(firstResponse.indexOf("\r\n\r\n") + 4).length());
+        } finally { proxy.proceed.countDown(); proxy.close(); }
+    }
+
+    @Test public void sameLaneStillSupersedes() throws Exception {
+        Proxy proxy = new Proxy("sftp", Stage.READ);
+        try (Socket first = request(proxy, "/video.mkv?lane=window", null)) {
+            assertTrue(proxy.entered.await(2, TimeUnit.SECONDS));
+            try (Socket second = request(proxy, "/video.mkv?lane=window", "bytes=16-31")) {
+                String response = new String(second.getInputStream().readAllBytes(), StandardCharsets.ISO_8859_1);
+                assertTrue(response, response.startsWith("HTTP/1.0 206"));
+            }
+            assertTrue("The older request of the lane must be cancelled", proxy.closed.await(2, TimeUnit.SECONDS));
+        } finally { proxy.proceed.countDown(); proxy.close(); }
+    }
+
+    @Test public void laneIsReadFromTheQuery() {
+        assertEquals("", StreamOverHttp.laneOf(""));
+        assertEquals("dv-window", StreamOverHttp.laneOf("lane=dv-window"));
+        assertEquals("a b", StreamOverHttp.laneOf("x=1&lane=a%20b"));
     }
 
     private void assertInterruptible(String scheme) throws Exception {

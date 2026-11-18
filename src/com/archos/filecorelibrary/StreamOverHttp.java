@@ -34,7 +34,9 @@ import java.io.BufferedInputStream;
 import java.io.IOException;
 import java.io.ByteArrayOutputStream;
 import java.io.EOFException;
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Map;
 import java.util.Set;
 import java.util.Locale;
 import java.io.InputStream;
@@ -49,6 +51,7 @@ import java.util.Arrays;
 import java.util.Enumeration;
 import java.util.List;
 import java.util.Properties;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 
 
@@ -78,8 +81,10 @@ public class StreamOverHttp {
 	private Thread mainThread;
 	private MetaFile2 mMetaFile;
 	private final AtomicInteger mNextRequestId = new AtomicInteger(1);
-	private volatile int mActiveMediaRequestId = 0;
-	private volatile HttpSession mActiveMediaSession;
+	// Per lane: a new media request only supersedes the older one of its own lane, so a player
+	// that opens several streams at once (e.g. VLC's dual view) can tag them with ?lane=...
+	private final Map<String, Integer> mActiveMediaRequestIds = new ConcurrentHashMap<>();
+	private final Map<String, HttpSession> mActiveMediaSessions = new HashMap<>(); // guarded by mSessionLock
 	private final Object mSessionLock = new Object();
 	private final Set<HttpSession> mSessions = new HashSet<>();
 	private volatile boolean mClosed;
@@ -239,6 +244,14 @@ public class StreamOverHttp {
 		return getUri(FileUtils.getName(posterLocalUri));
 	}
 
+	/** The lane=... parameter of a request's query string, "" when absent */
+	static String laneOf(String query) {
+		for (String parameter : query.split("&")) {
+			if (parameter.startsWith("lane=")) return Uri.decode(parameter.substring(5));
+		}
+		return "";
+	}
+
 	private static class RequestException extends IOException {
 		final String status;
 		RequestException(String status, String message) { super(message); this.status = status; }
@@ -257,6 +270,7 @@ public class StreamOverHttp {
 		private long requestedEnd = -1;
 		private boolean partialResponse;
 		private boolean supersedableMediaRequest;
+		private String lane = "";
 		private volatile boolean forceClosed;
 		private boolean responseStarted;
 		private int upstreamBufferSize = DEFAULT_UPSTREAM_BUFFER_SIZE;
@@ -283,16 +297,19 @@ public class StreamOverHttp {
 			if (!supersedableMediaRequest) return;
 			HttpSession previous;
 			synchronized (mSessionLock) {
-				if (mClosed || requestId < mActiveMediaRequestId) throw new IOException("Request superseded");
-				previous = mActiveMediaSession;
-				mActiveMediaSession = this;
-				mActiveMediaRequestId = requestId;
+				Integer active = mActiveMediaRequestIds.get(lane);
+				if (mClosed || (active != null && requestId < active)) throw new IOException("Request superseded");
+				previous = mActiveMediaSessions.put(lane, this);
+				mActiveMediaRequestIds.put(lane, requestId);
 			}
 			if (previous != null && previous != this) previous.cancel();
 		}
 
 		private boolean isCancelled() {
-			return forceClosed || (supersedableMediaRequest && requestId < mActiveMediaRequestId);
+			if (forceClosed) return true;
+			if (!supersedableMediaRequest) return false;
+			Integer active = mActiveMediaRequestIds.get(lane);
+			return active != null && requestId < active;
 		}
 
 		private void closeSocket() {
@@ -395,7 +412,7 @@ public class StreamOverHttp {
                                 System.nanoTime() - cancellationStarted, Math::max);
                     mSessionLock.notifyAll();
                 }
-				if (mActiveMediaSession == this) mActiveMediaSession = null;
+				if (mActiveMediaSessions.get(lane) == this) mActiveMediaSessions.remove(lane);
 			}
 		}
 
@@ -442,7 +459,13 @@ public class StreamOverHttp {
 					throw new RequestException(HTTP_416, "Multiple ranges unsupported");
 				requestHeaders.setProperty(name, lines[i].substring(colon + 1).trim());
 			}
-			return Uri.decode(request[1]);
+			String target = request[1];
+			int query = target.indexOf('?');
+			if (query >= 0) {
+				lane = laneOf(target.substring(query + 1));
+				target = target.substring(0, query);
+			}
+			return Uri.decode(target);
 		}
 
 		private void resolveRange() throws IOException {
